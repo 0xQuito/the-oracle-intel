@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Oracle</title>
+<style>
+  :root { --bg: #000; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #screen {
+    font-family: Consolas, "Cascadia Mono", "DejaVu Sans Mono", Menlo, monospace;
+    white-space: pre; color: #fff; background: #000;
+    font-size: var(--fs, 16px); line-height: var(--fs, 16px);
+    box-shadow: 0 0 60px rgba(80, 140, 255, .18);
+  }
+  .row { display: block; overflow: hidden; height: var(--fs, 16px); }
+  /* every run is exactly one row tall, so the highlight box isn't clipped */
+  .row span { display: inline-block; vertical-align: top; height: var(--fs, 16px); line-height: var(--fs, 16px); }
+  .go { cursor: pointer; }
+  /* the highlight box: the item is drawn inverted, with a frame around it */
+  .sel { outline: 2px solid #0000ff; outline-offset: -2px; }
+  /* faint CRT scanlines */
+  body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0,0,0,.22) 2px 3px);
+  }
+  body.noscan::after { display: none; }
+</style>
+</head>
+<body>
+<div id="screen" role="main" aria-live="polite"></div>
+<script>
+"use strict";
+const WHITE = "#ffffff", YELLOW = "#ffff00", CYAN = "#00ffff", BLUE = "#0000ff", BLACK = "#000000";
+const screen = document.getElementById("screen");
+const params = new URLSearchParams(location.search);
+
+const S = {
+  cols: 80, rows: 32,
+  page: 100, shown: 100, sub: 0, entry: "",
+  reveal: false, data: null,
+  sel: 0,        // index into data.items: the highlighted thing
+  want: null,    // where the highlight should land when the next page data arrives
+  memory: {},    // page -> {sub, sel}, so Back returns to the same item
+  searching: false, searchStart: 0, fresh: false, token: 0,
+};
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ------------------------------------------------------------- drawing
+
+function span(text, fg, bg) {
+  const el = document.createElement("span");
+  el.textContent = text;            // feed text is untrusted: never innerHTML
+  el.style.color = fg;
+  el.style.background = bg;
+  return el;
+}
+
+// opts.regions: the selectable items on this row ({i, start, end, hl});
+// opts.fill: the row's own background colour.
+function rowEl(runs, opts = {}) {
+  const div = document.createElement("div");
+  div.className = "row";
+  const regions = opts.regions || [];
+  const fill = opts.fill || BLACK;
+  let col = 0, lastBg = fill, box = null;
+  for (const [text, fg, bg] of runs) {
+    const t = text.slice(0, S.cols - col);
+    if (!t) break;
+    let k = 0;
+    while (k < t.length) {
+      // cut the run wherever a selectable item starts or ends
+      let stop = t.length;
+      for (const r of regions) {
+        for (const edge of [r.start - col, r.end - col]) if (edge > k && edge < stop) stop = edge;
+      }
+      const piece = t.slice(k, stop), c = col + k;
+      const reg = regions.find(r => c >= r.start && c < r.end);
+      if (!reg) {
+        box = null;
+        div.append(span(piece, fg, bg));
+      } else {
+        const on = reg.i === S.sel && !S.searching;
+        if (!box || Number(box.dataset.i) !== reg.i) {
+          box = document.createElement("span");
+          box.className = on ? "go sel" : "go";
+          box.dataset.i = reg.i;
+          div.append(box);
+        }
+        // highlighted: black on the highlight colour; badges keep their own colours
+        box.append(on && bg === fill ? span(piece, BLACK, reg.hl) : span(piece, fg, bg));
+      }
+      k = stop;
+    }
+    col += t.length; lastBg = bg;
+  }
+  if (col < S.cols) div.append(span(" ".repeat(S.cols - col), WHITE, opts.fill || lastBg));
+  return div;
+}
+
+function regionsFor(row) {
+  const items = (S.data && S.data.items) || [];
+  return items.map((it, i) => ({ ...it, i })).filter(it => it.row === row);
+}
+
+function leftRight(left, right, fill = BLACK) {
+  const len = a => a.reduce((n, r) => n + r[0].length, 0);
+  const gap = Math.max(1, S.cols - len(left) - len(right));
+  return [...left, [" ".repeat(gap), WHITE, fill], ...right];
+}
+
+function typed() {
+  return S.entry ? (S.entry + "___").slice(0, 3) : String(S.page);
+}
+
+function headerRuns() {
+  const d = new Date();
+  const p2 = n => String(n).padStart(2, "0");
+  const date = d.toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short" }).replace(/,/g, "");
+  const time = `${p2(d.getHours())}:${p2(d.getMinutes())}/${p2(d.getSeconds())}`;
+  return leftRight(
+    [[" P" + typed(), WHITE, BLACK], [" THE ORACLE ", CYAN, BLACK], [String(S.shown), WHITE, BLACK]],
+    [[date + " ", WHITE, BLACK], [time + " ", YELLOW, BLACK]]);
+}
+
+function promptRuns() {
+  const t = (S.entry + "---").slice(0, 3);   // dashes: underscores get clipped by the row height
+  const wide = S.cols >= 100;
+  let hint = wide ? "   ARROWS move  ENTER select  N/P subpage  B back  U update  V reveal  ? help"
+                  : "  ARROWS+ENTER:select  N/P:sub  B:back  ?:help";
+  if (S.data && S.data.link) hint = (wide ? "   O open story" : "  O:open") + hint;
+  return [[" PAGE> ", YELLOW, BLUE], [t, WHITE, BLUE], [hint, CYAN, BLUE]];
+}
+
+function draw() {
+  const rows = [rowEl(headerRuns())];
+  const d = S.data;
+  const bodyCount = S.rows - 4;           // everything between header and the bottom three rows
+  const last = d ? d.rows.length - 1 : 0;   // the coloured links row
+  if (d) {
+    d.rows.slice(0, last - 1).forEach((r, i) => rows.push(rowEl(r, { regions: regionsFor(i), fill: d.fills[i] })));
+  }
+  while (rows.length < bodyCount + 1) rows.push(rowEl([]));
+  const status = S.searching
+    ? [[` Searching for page ${S.page}...`, YELLOW, BLACK]]
+    : (d ? d.rows[last - 1] : []);
+  rows.push(rowEl(status));
+  rows.push(d ? rowEl(d.rows[last], { regions: regionsFor(last), fill: d.fills[last] }) : rowEl([]));
+  rows.push(rowEl(promptRuns(), { fill: BLUE }));
+  screen.replaceChildren(...rows);
+}
+
+function drawChrome() {
+  if (!screen.firstChild) return draw();
+  screen.firstChild.replaceWith(rowEl(headerRuns()));
+  const kids = screen.children;
+  kids[kids.length - 1].replaceWith(rowEl(promptRuns(), { fill: BLUE }));
+  if (S.searching) kids[kids.length - 3].replaceWith(rowEl([[` Searching for page ${S.page}...`, YELLOW, BLACK]]));
+}
+
+// Size the text so the whole teletext grid fills the window.
+function fit() {
+  const probe = document.createElement("span");
+  probe.style.cssText = "position:absolute;visibility:hidden;font-size:100px;white-space:pre;font-family:" +
+    getComputedStyle(screen).fontFamily;
+  probe.textContent = "M".repeat(50);
+  document.body.append(probe);
+  const charW = probe.getBoundingClientRect().width / 50 / 100;
+  probe.remove();
+  const fs = Math.floor(Math.min(innerWidth * 0.98 / (S.cols * charW), innerHeight * 0.98 / S.rows));
+  screen.style.setProperty("--fs", fs + "px");
+}
+
+// ---------------------------------------------------------- talking to the server
+
+async function fetchPage({ quiet = false } = {}) {
+  const token = ++S.token;
+  if (!quiet) { S.searching = true; S.searchStart = performance.now(); }
+  const q = new URLSearchParams({
+    n: S.page, sub: S.sub, cols: S.cols, rows: S.rows,
+    reveal: S.reveal ? 1 : 0, fresh: S.fresh ? 1 : 0,
+  });
+  let d;
+  try {
+    d = await (await fetch("/api/page?" + q)).json();
+  } catch (e) {
+    d = null;
+  }
+  if (token !== S.token) return;                    // the user has moved on
+  if (!d || !d.ready) {                              // feed still loading (or server busy): keep hunting
+    setTimeout(() => token === S.token && fetchPage({ quiet: true }), d ? 400 : 2000);
+    return;
+  }
+  const wait = Math.max(0, 350 - (performance.now() - S.searchStart));
+  setTimeout(() => {
+    if (token !== S.token) return;
+    S.fresh = false;
+    S.searching = false;
+    S.data = d; S.sub = d.sub; S.shown = d.n;
+    if (S.want !== null) { S.sel = resolveSel(d.items, S.want); S.want = null; }
+    S.sel = clamp(S.sel, 0, Math.max(0, d.items.length - 1));
+    remember();
+    draw();
+  }, S.searching ? wait : 0);
+}
+
+function remember() {
+  S.memory[S.page] = { sub: S.sub, sel: S.sel };
+}
+
+function goto(n) {
+  n = clamp(parseInt(n, 10) || 100, 100, 899);
+  if (location.hash === "#" + n) load(n);
+  else location.hash = "#" + n;                     // hashchange -> load; keeps browser Back working
+}
+
+function load(n) {
+  const m = S.memory[n];
+  S.page = n;
+  S.sub = m ? m.sub : 0;
+  S.want = m ? m.sel : ["first", 0];
+  draw();
+  fetchPage();
+}
+
+function fromHash() {
+  const n = parseInt(location.hash.slice(1), 10);
+  load(n >= 100 && n <= 899 ? n : 100);
+}
+
+function changeSub(delta, where) {
+  if (!S.data || S.searching) return;
+  const it = S.data.items[S.sel];
+  S.sub = (S.sub + delta + S.data.subs) % S.data.subs;
+  S.want = where || ["first", it ? anchor(it) : 0];
+  fetchPage({ quiet: true });
+}
+
+// ------------------------------------------------- arrow-key selection
+// A copy of move() and resolve() in nav.py: keep the two in step.
+
+const centre = it => (it.start + it.end) / 2;
+const anchor = it => it.start + 1;             // keeps Up/Down in the same column
+const covers = (it, x) => it.start <= x && x < it.end;
+function nearest(items, idxs, x) {
+  const inside = idxs.filter(j => covers(items[j], x));
+  if (inside.length) return inside[0];
+  return idxs.reduce((b, j) => Math.abs(centre(items[j]) - x) < Math.abs(centre(items[b]) - x) ? j : b);
+}
+
+function resolveSel(items, where) {
+  if (!items.length) return 0;
+  if (typeof where === "number") return clamp(where, 0, items.length - 1);
+  const [kind, x] = where;
+  const body = items.map((_, j) => j).filter(j => !items[j].fast);
+  if (kind === "first" && body.length) return body[0];
+  if (kind === "last" && body.length) return body[body.length - 1];
+  const bar = items.map((_, j) => j).filter(j => items[j].fast);
+  return bar.length ? nearest(items, bar, x) : 0;
+}
+
+function move(items, i, key, sub, nsubs) {
+  const cur = items[i], x = anchor(cur);
+  if (key === "UP" || key === "DOWN") {
+    const d = key === "DOWN" ? 1 : -1;
+    const rows = [...new Set(items.filter(it => (it.row - cur.row) * d > 0).map(it => it.row))]
+      .sort((a, b) => (a - b) * d);
+    if (rows.length) {
+      // prefer the nearest row with something in this column, else just the nearest row
+      const row = rows.find(r => items.some(it => it.row === r && covers(it, x))) ?? rows[0];
+      return [0, nearest(items, items.map((_, j) => j).filter(j => items[j].row === row), x)];
+    }
+    if (d > 0) return [nsubs > 1 ? 1 : 0, ["first", x]];
+    return sub > 0 ? [-1, ["last", x]] : [0, ["bar", x]];
+  }
+  const d = key === "RIGHT" ? 1 : -1;
+  const same = items.map((_, j) => j).filter(j => items[j].row === cur.row);
+  const k = same.indexOf(i) + d;
+  if (k >= 0 && k < same.length) return [0, same[k]];
+  if (cur.fast) return [0, same[(k + same.length) % same.length]];
+  if (nsubs > 1) return [d, ["first", x]];
+  return [0, i];
+}
+
+function arrow(key) {
+  const d = S.data;
+  if (!d || S.searching || !d.items.length) return;
+  const [delta, where] = move(d.items, S.sel, key, S.sub, d.subs);
+  if (delta) return changeSub(delta, where);
+  S.sel = resolveSel(d.items, where);
+  remember();
+  draw();
+}
+
+function select() {
+  const d = S.data;
+  if (d && !S.searching && d.items.length) goto(d.items[S.sel].page);
+}
+
+async function step(delta) {
+  const d = await (await fetch(`/api/step?n=${S.page}&d=${delta}`)).json();
+  goto(d.n);
+}
+
+async function refresh() {
+  await fetch(`/api/refresh?n=${S.page}`);
+  S.fresh = true;
+  fetchPage();
+}
+
+// --------------------------------------------------------------------- input
+
+function onKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;   // leave browser shortcuts alone
+  const k = e.key;
+  const low = k.length === 1 ? k.toLowerCase() : k;
+  const fast = { r: 0, g: 1, y: 2, c: 3, F1: 0, F2: 1, F3: 2, F4: 3 };
+  let handled = true;
+  if (/^\d$/.test(k)) {
+    if (!S.entry && (k === "0" || k === "9")) return;
+    S.entry += k;
+    if (S.entry.length === 3) { const n = S.entry; S.entry = ""; goto(n); }
+    drawChrome();
+  } else if (k === "Backspace") { S.entry = S.entry.slice(0, -1); drawChrome(); }
+  else if (k === "Escape") { S.entry = ""; drawChrome(); }
+  else if (k.startsWith("Arrow")) arrow(k.slice(5).toUpperCase());
+  else if (k === "Enter") select();
+  else if (low === "n" || k === " ") changeSub(1);
+  else if (low === "p") changeSub(-1);
+  else if (k === "+" || k === "=") step(1);
+  else if (k === "-") step(-1);
+  else if (low in fast) { const p = S.data && S.data.fastext[fast[low]]; if (p) goto(p); }
+  else if (low === "i") goto(100);
+  else if (low === "?" || low === "h") goto(199);
+  else if (low === "b") history.back();
+  else if (low === "u") refresh();
+  else if (low === "v") { S.reveal = !S.reveal; fetchPage({ quiet: true }); }
+  else if (low === "o") { if (S.data && S.data.link) window.open(S.data.link, "_blank", "noopener"); }
+  else if (low === "s") document.body.classList.toggle("noscan");
+  else handled = false;
+  if (handled) e.preventDefault();
+}
+
+function onClick(e) {
+  const el = e.target.closest(".go");
+  if (el && S.data && S.data.items[el.dataset.i]) goto(S.data.items[el.dataset.i].page);
+}
+
+// pointing at an item with the mouse moves the highlight there too. Only real
+// movement counts: redrawing under a resting pointer mustn't steal the highlight.
+let lastMouse = "";
+function onHover(e) {
+  const at = e.clientX + "," + e.clientY;
+  if (at === lastMouse) return;
+  lastMouse = at;
+  const el = e.target.closest(".go");
+  if (!el || S.searching) return;
+  const i = Number(el.dataset.i);
+  if (i !== S.sel) { S.sel = i; remember(); draw(); }
+}
+
+// ---------------------------------------------------------------------- start
+
+async function init() {
+  try {
+    const cfg = await (await fetch("/api/config")).json();
+    S.cols = cfg.cols; S.rows = cfg.rows;
+  } catch (e) { /* use defaults */ }
+  S.cols = clamp(parseInt(params.get("cols"), 10) || S.cols, 40, 160);
+  S.rows = clamp(parseInt(params.get("rows"), 10) || S.rows, 25, 60);
+  fit();
+  addEventListener("resize", fit);
+  addEventListener("hashchange", fromHash);
+  document.addEventListener("keydown", onKey);
+  screen.addEventListener("click", onClick);
+  screen.addEventListener("mousemove", onHover);
+  fromHash();
+  // header clock, and the rolling page counter while hunting for a page
+  setInterval(() => {
+    if (S.searching) { S.shown = (S.shown - 100 + 7) % 800 + 100; drawChrome(); }
+  }, 70);
+  setInterval(() => { if (!S.searching) drawChrome(); }, 1000);
+  // quietly pick up fresh data (it's a local server, so this is cheap)
+  setInterval(() => { if (!S.searching && !S.entry) fetchPage({ quiet: true }); }, 20000);
+}
+init();
+</script>
+</body>
+</html>

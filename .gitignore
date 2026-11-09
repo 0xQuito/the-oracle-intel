@@ -1,0 +1,14 @@
+# Python's compiled cache files: rebuilt automatically, never worth saving
+__pycache__/
+*.pyc
+
+# Virtual environments, if you ever make one
+.venv/
+venv/
+
+# Editor and OS clutter
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
